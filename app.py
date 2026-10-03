@@ -3,6 +3,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import streamlit as st
+import llm
 from features import FEATURES, LABELS, REASONS, prep
 
 A = Path(__file__).parent / "artifacts"
@@ -30,21 +31,64 @@ def score(row):
     return float(p), contrib, X
 
 
+# Form state lives in session_state so the Gemini intake can fill it.
+DEFAULTS = {"age": 35, "income": 5000, "debt": 0.35, "util": 0.30, "l30": 0, "l60": 0, "l90": 0, "lines": 6, "re": 1}
+UI = {v[0]: v[4] for v in llm.FIELDS.values()}
+for k, v in DEFAULTS.items():
+    st.session_state.setdefault(k, v)
+
+
+def run_intake():
+    values, notes, err = llm.extract(st.session_state.get("intake_text", ""))
+    if err:
+        st.session_state["intake_msg"] = ("error", err, [])
+        return
+    if "util" in values:  # snap to the slider's 0.05 grid
+        values["util"] = round(round(values["util"] / 0.05) * 0.05, 2)
+    for k, v in values.items():
+        st.session_state[k] = v
+    st.session_state["intake_msg"] = ("ok", values, notes)
+
+
 st.title("Loan underwriting desk")
 if M["data_source"] == "synthetic":
     st.warning("Demo model trained on synthetic data. Retrain on real data before trusting any number here.")
 
+with st.expander("Describe the applicant in plain text (Gemini fills the form)", expanded=False):
+    st.caption("Your text is sent to Google's Gemini API to read the fields. Use made-up applicants only, "
+               "with no names, emails or ID numbers. Gemini only reads the text. The scorecard makes the decision.")
+    st.text_area("Applicant description", key="intake_text", height=90, disabled=not llm.configured(),
+                 placeholder="34 years old, earns 60000 a month, card usage about 40%, one payment 30 days late, "
+                             "7 open credit lines, monthly debt payments around 25% of income")
+    if not llm.configured():
+        st.info("Gemini isn't configured here. Add GEMINI_API_KEY to the app secrets to turn this on.")
+    st.button("Fill form from text", on_click=run_intake, disabled=not llm.configured())
+    msg = st.session_state.get("intake_msg")
+    if msg:
+        if msg[0] == "error":
+            st.error(msg[1])
+        else:
+            _, vals, notes = msg
+            if vals:
+                st.success("Filled: " + ", ".join(f"{UI[k]} = {v}" for k, v in vals.items()))
+                miss = [UI[k] for k in DEFAULTS if k not in vals]
+                if miss:
+                    st.warning("Not mentioned, so left at the current sidebar value: " + ", ".join(miss) +
+                               ". Check these before relying on the decision.")
+            for n in notes:
+                st.warning(n)
+
 with st.sidebar:
     st.header("Application")
-    age = st.number_input("Age", 18, 90, 35)
-    income = st.number_input("Monthly income (0 if not provided)", 0, 1_000_000, 5000, step=250)
-    debt = st.number_input("Monthly debt payments ÷ income", 0.0, 5.0, 0.35, 0.05)
-    util = st.slider("Credit utilisation (balance ÷ limit)", 0.0, 1.5, 0.30, 0.05)
-    l30 = st.number_input("Times 30-59 days late (last 2 yrs)", 0, 10, 0)
-    l60 = st.number_input("Times 60-89 days late (last 2 yrs)", 0, 10, 0)
-    l90 = st.number_input("Times 90+ days late", 0, 10, 0)
-    lines = st.number_input("Open credit lines and loans", 0, 40, 6)
-    re = st.number_input("Real-estate loans", 0, 10, 1)
+    age = st.number_input("Age", min_value=18, max_value=90, key="age")
+    income = st.number_input("Monthly income (0 if not provided)", min_value=0, max_value=1_000_000, step=250, key="income")
+    debt = st.number_input("Monthly debt payments ÷ income", min_value=0.0, max_value=5.0, step=0.05, key="debt")
+    util = st.slider("Credit utilisation (balance ÷ limit)", min_value=0.0, max_value=1.5, step=0.05, key="util")
+    l30 = st.number_input("Times 30-59 days late (last 2 yrs)", min_value=0, max_value=10, key="l30")
+    l60 = st.number_input("Times 60-89 days late (last 2 yrs)", min_value=0, max_value=10, key="l60")
+    l90 = st.number_input("Times 90+ days late", min_value=0, max_value=10, key="l90")
+    lines = st.number_input("Open credit lines and loans", min_value=0, max_value=40, key="lines")
+    re = st.number_input("Real-estate loans", min_value=0, max_value=10, key="re")
 
 row = {"RevolvingUtilizationOfUnsecuredLines": util, "age": age, "DebtRatio": debt,
        "MonthlyIncome": income if income > 0 else np.nan, "NumberOfTime30-59DaysPastDueNotWorse": l30,
@@ -65,6 +109,15 @@ else:
     notes.append("Income was not provided, so a credit officer must verify it." if income == 0 and p <= acc
                  else f"Default risk {p:.1%} sits between the accept ({acc:.1%}) and reject ({rej:.1%}) cut-offs.")
 
+order = sorted(zip(FEATURES, contrib), key=lambda t: -t[1])
+facts = {
+    "decision": decision, "pd": f"{p:.1%}", "accept_below": f"{acc:.1%}", "reject_above": f"{rej:.1%}",
+    "decision_note": " ".join(notes),
+    "raising_risk": [f"{LABELS[f]} (x{np.exp(c):.2f})" for f, c in order if c > 0.02][:3],
+    "lowering_risk": [f"{LABELS[f]} (x{np.exp(c):.2f})" for f, c in order[::-1] if c < -0.02][:2],
+}
+fkey = json.dumps(facts, sort_keys=True)
+
 t1, t2, t3 = st.tabs(["Decision", "Model card", "Fairness"])
 with t1:
     c1, c2, c3 = st.columns(3)
@@ -72,6 +125,20 @@ with t1:
     c2.metric("Probability of default", f"{p:.1%}")
     c3.metric("Auto-accept / reject at", f"{acc:.1%} / {rej:.1%}")
     {"Accept": st.success, "Refer": st.warning, "Reject": st.error}[decision](" ".join(notes))
+
+    st.subheader("Plain-English summary")
+    if st.button("Explain this decision"):
+        text, source = llm.explain(facts)
+        st.session_state["expl"] = (fkey, text, source)
+    ex = st.session_state.get("expl")
+    if ex and ex[0] == fkey:
+        st.write(ex[1])
+        st.caption("Written by Gemini from the scorecard's output. The decision above is not changed by it."
+                   if ex[2] == "gemini" else
+                   "Template summary (Gemini unavailable or its output failed the number check).")
+    elif ex:
+        st.caption("Inputs changed since the last summary. Press the button again.")
+
     st.subheader("What drove the score")
     st.caption("Impact on log-odds of default versus the average applicant. Right raises risk, left lowers it.")
     s = pd.Series(contrib, index=[LABELS[f] for f in FEATURES]).sort_values()
@@ -81,7 +148,7 @@ with t1:
     st.dataframe(tbl, hide_index=True, width="stretch")
     if decision != "Accept":
         st.subheader("Adverse-action reasons")
-        top = [f for f, c in sorted(zip(FEATURES, contrib), key=lambda t: -t[1]) if c > 0.02][:4]
+        top = [f for f, c in order if c > 0.02][:4]
         for f in top:
             st.write("• " + REASONS[f])
         if not top:
